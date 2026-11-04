@@ -5,6 +5,8 @@ import cv2
 import mediapipe as mp
 import pyautogui
 
+import json 
+
 CAM_W, CAM_H = 1280, 720      # camera resolution (higher = better tracking at distance)
 BOX_X = (0.20, 0.80)          # part of the camera frame (left..right) that maps to the full screen
 BOX_Y = (0.15, 0.65)          # part of the camera frame (top..bottom) that maps to the full screen
@@ -84,6 +86,75 @@ class OneEuro:
         self.x_prev, self.dx_prev, self.t_prev = x_hat, dx_hat, t
         return x_hat
 
+
+CALIB_FILE = "calibration.json"
+
+def load_calibration():
+    try:
+        with open(CALIB_FILE) as f: 
+            d = json.load(f)
+        return tuple(d["x"]), tuple(d["y"])
+    except Exception:
+        return None
+
+def save_calibration(bx, by):
+    with open(CALIB_FILE, "w") as f:
+        json.dump({"x": bx, "y": by}, f)
+
+def calibrate(cap, landmarker):
+    # calibrate the control box by having the user reach to two corners and press SPACE 
+    points = []
+    for name in ("TOP-LEFT", "BOTTOM-RIGHT"):
+        samples = []
+        capture_until = None
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                return None
+            frame = cv2.flip(frame, 1)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            result = landmarker.detect_for_video(mp_image, int(time.time() * 1000))
+
+            h, w, _ = frame.shape
+            now = time.time()
+            pointer = result.hand_landmarks[0][9] if result.hand_landmarks else None
+            if pointer:
+                cv2.circle(frame, (int(pointer.x * w), int(pointer.y * h)), 10, (0, 0, 255), -1)
+
+            if capture_until is not None:
+                msg = "Hold still..."
+                if pointer:
+                    samples.append((pointer.x, pointer.y))
+                if now >= capture_until:
+                    if len(samples) >= 5:
+                        break                      # got enough samples
+                    capture_until, samples = None, []   # hand was lost, try again
+            else:
+                msg = "Reach to your %s comfortable point, press SPACE" % name
+
+            cv2.putText(frame, msg, (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+            cv2.putText(frame, "q = cancel", (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.imshow("Hand Mouse", frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                return None
+            if key == 32 and capture_until is None and pointer:   # SPACE
+                capture_until, samples = now + 1.0, []
+
+        px = sum(s[0] for s in samples) / len(samples)
+        py = sum(s[1] for s in samples) / len(samples)
+        points.append((px, py))
+
+    (x1, y1), (x2, y2) = points
+    bx = (min(x1, x2), max(x1, x2))
+    by = (min(y1, y2), max(y1, y2))
+    if bx[1] - bx[0] < 0.1 or by[1] - by[0] < 0.1:      # corners too close together
+        return None
+    return bx, by
+    
+
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_W)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
@@ -98,6 +169,10 @@ scroll_accum = 0.0
 
 try:
     with HandLandmarker.create_from_options(options) as landmarker:
+        calib = load_calibration() or calibrate(cap, landmarker)
+        if calib:
+            BOX_X, BOX_Y = calib
+            save_calibration(BOX_X, BOX_Y)
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -184,7 +259,6 @@ try:
                 if left_down:
                     pyautogui.mouseUp()
                     left_down = False
-                mode = None
                 filt_x.reset()
                 filt_y.reset()
 
@@ -199,8 +273,20 @@ try:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
             cv2.imshow("Hand Mouse", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
                 break
+            if key == ord("c"):
+                if left_down:
+                    pyautogui.mouseUp()
+                    left_down = False
+                mode = None
+                new_box = calibrate(cap, landmarker)
+                if new_box:
+                    BOX_X, BOX_Y = new_box
+                    save_calibration(BOX_X, BOX_Y)
+                filt_x.reset()
+                filt_y.reset()
 finally:
     if left_down:
         pyautogui.mouseUp()
