@@ -5,11 +5,11 @@ import cv2
 import mediapipe as mp
 import pyautogui
 
-# ---------------- settings you can tune ----------------
 CAM_W, CAM_H = 1280, 720      # camera resolution (higher = better tracking at distance)
 BOX_X = (0.20, 0.80)          # part of the camera frame (left..right) that maps to the full screen
 BOX_Y = (0.15, 0.65)          # part of the camera frame (top..bottom) that maps to the full screen
-SMOOTHING = 4.0               # higher = smoother but laggier cursor
+MIN_CUTOFF = 0.5             # lower = steader when still (more smoothing)
+BETA = 8.0                    # higher = less lag when moving fast 
 PINCH_ON = 0.30               # pinch counts as "closed" below this (relative to palm size)
 PINCH_OFF = 0.50              # pinch counts as "released" above this (hysteresis stops flicker)
 SCROLL_GAIN = 3000            # scroll speed while the scroll pinch is held
@@ -53,12 +53,44 @@ def is_fist(hand, w, h):
             return False
     return True
 
+class OneEuro:
+    def __init__(self, min_cutoff=1.0, beta=8.0, d_cutoff=1.0):
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self.reset()
+
+    def reset(self):
+        self.x_prev = None
+        self.dx_prev = 0.0
+        self.t_prev = None
+
+    @staticmethod
+    def _alpha(cutoff, dt):
+        tau = 1.0 / (2 * math.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
+
+    def __call__(self, x, t):
+        if self.t_prev is None:
+            self.x_prev, self.t_prev = x, t
+            return x
+        dt = max(t - self.t_prev, 1e-6)
+        dx = (x - self.x_prev) / dt                       # this is how fast it's moving
+        a_d = self._alpha(self.d_cutoff, dt)
+        dx_hat = a_d * dx + (1 - a_d) * self.dx_prev      # smoothed speed
+        cutoff = self.min_cutoff + self.beta * abs(dx_hat)  # faster -> less smoothing
+        a = self._alpha(cutoff, dt)
+        x_hat = a * x + (1 - a) * self.x_prev
+        self.x_prev, self.dx_prev, self.t_prev = x_hat, dx_hat, t
+        return x_hat
 
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_W)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_H)
 
 cur_x = cur_y = None          # smoothed cursor position
+filt_x = OneEuro(MIN_CUTOFF, BETA)
+filt_y = OneEuro(MIN_CUTOFF, BETA)
 mode = None                   # None, "left", "right" or "scroll"
 left_down = False             # is the left button currently held?
 scroll_prev_y = None
@@ -134,15 +166,13 @@ try:
                         scroll_accum -= amount
                 else:
                     status = {"left": "LEFT CLICK / DRAG", "right": "RIGHT CLICK"}.get(mode, "MOVE")
-                    tx = remap(pointer.x, BOX_X[0], BOX_X[1], screen_w)
-                    ty = remap(pointer.y, BOX_Y[0], BOX_Y[1], screen_h)
-                    tx = max(EDGE, min(screen_w - 1 - EDGE, tx))
-                    ty = max(EDGE, min(screen_h - 1 - EDGE, ty))
-                    if cur_x is None:
-                        cur_x, cur_y = tx, ty
-                    else:
-                        cur_x += (tx - cur_x) / SMOOTHING
-                        cur_y += (ty - cur_y) / SMOOTHING
+                    t = time.time()
+                    fx = filt_x(pointer.x, t)
+                    fy = filt_y(pointer.y, t)
+                    tx = remap(fx, BOX_X[0], BOX_X[1], screen_w)
+                    ty = remap(fy, BOX_Y[0], BOX_Y[1], screen_h)
+                    cur_x = max(EDGE, min(screen_w - 1 - EDGE, tx))
+                    cur_y = max(EDGE, min(screen_h - 1 - EDGE, ty))
                     pyautogui.moveTo(int(cur_x), int(cur_y))
 
                 # ---- draw the hand ----
@@ -155,6 +185,8 @@ try:
                     pyautogui.mouseUp()
                     left_down = False
                 mode = None
+                filt_x.reset()
+                filt_y.reset()
 
             # control box and status text
             cv2.rectangle(frame,
