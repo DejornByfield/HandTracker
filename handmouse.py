@@ -7,15 +7,22 @@ import pyautogui
 
 import json 
 
+import  joblib 
+from collections import Counter, deque
+from features import hand_features
+
+
+
 CAM_W, CAM_H = 1280, 720      # camera resolution (higher = better tracking at distance)
 BOX_X = (0.20, 0.80)          # part of the camera frame (left..right) that maps to the full screen
 BOX_Y = (0.15, 0.65)          # part of the camera frame (top..bottom) that maps to the full screen
-MIN_CUTOFF = 0.5             # lower = steader when still (more smoothing)
+MIN_CUTOFF = 1                # lower = steader when still (more smoothing)
 BETA = 8.0                    # higher = less lag when moving fast 
 PINCH_ON = 0.30               # pinch counts as "closed" below this (relative to palm size)
 PINCH_OFF = 0.50              # pinch counts as "released" above this (hysteresis stops flicker)
 SCROLL_GAIN = 3000            # scroll speed while the scroll pinch is held
 EDGE = 5                      # keeps the cursor out of the screen corners (see failsafe)
+HOLD_TIME = 0.45              # how long to hold a pinch before it counts as a drag
 
 pyautogui.PAUSE = 0           # no built-in delay after each call
 pyautogui.FAILSAFE = True     # slam the real mouse into the top-left corner to emergency-stop
@@ -164,8 +171,15 @@ filt_x = OneEuro(MIN_CUTOFF, BETA)
 filt_y = OneEuro(MIN_CUTOFF, BETA)
 mode = None                   # None, "left", "right" or "scroll"
 left_down = False             # is the left button currently held?
+pinch_start = 0.0             # when the current pinch started 
 scroll_prev_y = None
 scroll_accum = 0.0
+
+try:
+    gesture_model = joblib.load("gesture_model.joblib")
+except Exception:
+    gesture_model = None
+recent = deque(maxlen=5)             # recent gesture predictions, for smoothing
 
 try:
     with HandLandmarker.create_from_options(options) as landmarker:
@@ -187,9 +201,16 @@ try:
             h, w, _ = frame.shape
             status = "NO HAND"
             ratio_text = ""
+            gesture = ""
 
             if result.hand_landmarks:
                 hand = result.hand_landmarks[0]
+                if gesture_model is not None: 
+                    feats = hand_features(hand, w, h).reshape(1, -1)
+                    probs = gesture_model.predict_proba(feats)[0]
+                    best = probs.argmax()
+                    recent.append(gesture_model.classes_[best] if probs[best] > 0.6 else "?")
+                    gesture = Counter(recent).most_common(1)[0][0]
                 thumb, index, middle, ring = hand[4], hand[8], hand[12], hand[16]
                 pointer = hand[9]                      # middle knuckle: stays steady during pinches
                 palm = dist(hand[0], hand[9], w, h)    # hand size, so distance doesn't matter
@@ -213,19 +234,27 @@ try:
                     new_mode = best if ratios[best] < PINCH_ON else None
 
                 # ---- act on mode changes ----
+                now = time.time()
                 if new_mode != mode:
-                    if mode == "left" and left_down:
-                        pyautogui.mouseUp()
-                        left_down = False
+                    if mode == "left":
+                        if left_down:                           # was dragging: drop it
+                            pyautogui.mouseUp()
+                            left_down = False
+                        elif new_mode is None and not paused:   # let go before HOLD_TIME: a click
+                            pyautogui.click()
                     if new_mode == "left":
-                        pyautogui.mouseDown()
-                        left_down = True
+                        pinch_start = now                       # start timing the hold
                     elif new_mode == "right":
                         pyautogui.rightClick()
                     elif new_mode == "scroll":
                         scroll_prev_y = pointer.y
                         scroll_accum = 0.0
                     mode = new_mode
+
+                # ---- a pinch held long enough becomes a drag ----
+                if mode == "left" and not left_down and now - pinch_start >= HOLD_TIME:
+                    pyautogui.mouseDown()
+                    left_down = True
 
                 # ---- move or scroll ----
                 if paused:
@@ -234,13 +263,16 @@ try:
                     status = "SCROLL"
                     dy = pointer.y - scroll_prev_y
                     scroll_prev_y = pointer.y
-                    scroll_accum += dy * SCROLL_GAIN   # hand up -> page down (flip the sign to reverse)
+                    scroll_accum += dy * SCROLL_GAIN
                     amount = int(scroll_accum)
                     if amount:
                         pyautogui.scroll(amount)
                         scroll_accum -= amount
+                elif mode in ("left", "right") and not left_down:
+                    # cursor stays put so the click lands where you aimed
+                    status = "PINCH - hold to drag" if mode == "left" else "RIGHT CLICK"
                 else:
-                    status = {"left": "LEFT CLICK / DRAG", "right": "RIGHT CLICK"}.get(mode, "MOVE")
+                    status = "DRAGGING" if left_down else "MOVE"
                     t = time.time()
                     fx = filt_x(pointer.x, t)
                     fy = filt_y(pointer.y, t)
@@ -271,6 +303,8 @@ try:
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
             cv2.putText(frame, ratio_text, (10, 75),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(frame, "gesture: " + gesture, (10, 110),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
 
             cv2.imshow("Hand Mouse", frame)
             key = cv2.waitKey(1) & 0xFF
