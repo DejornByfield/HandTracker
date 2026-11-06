@@ -11,6 +11,9 @@ import  joblib
 from collections import Counter, deque
 from features import hand_features
 
+import os 
+import sys
+
 
 
 CAM_W, CAM_H = 1280, 720      # camera resolution (higher = better tracking at distance)
@@ -23,6 +26,12 @@ PINCH_OFF = 0.50              # pinch counts as "released" above this (hysteresi
 SCROLL_GAIN = 3000            # scroll speed while the scroll pinch is held
 EDGE = 5                      # keeps the cursor out of the screen corners (see failsafe)
 HOLD_TIME = 0.45              # how long to hold a pinch before it counts as a drag
+GESTURE_HOLD = 0.25           # seconds a gesture must be held to count as a click (for gestures that click)
+GESTURE_COOLDOWN = 0.8        # seconds after a gesture click before another gesture click is allowed
+GESTURE_ACTIONS = {           # gesture -> action mapping (edit freely)
+    "peace": lambda: pyautogui.hotkey("pagedown"),
+    "thumbs_up": lambda: pyautogui.hotkey("pageup"),
+}
 
 pyautogui.PAUSE = 0           # no built-in delay after each call
 pyautogui.FAILSAFE = True     # slam the real mouse into the top-left corner to emergency-stop
@@ -33,14 +42,23 @@ HandLandmarker = mp.tasks.vision.HandLandmarker
 HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
 RunningMode = mp.tasks.vision.RunningMode
 
+def resource_path(name): 
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
+
+def user_path(name):
+    #Files such as calibration.json are stored in the same folder as the executable, not in the temp folder
+    folder = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "HandMouse")
+    os.makedirs(folder, exist_ok=True)
+    return os.path.join(folder, name)
+
 options = HandLandmarkerOptions(
-    base_options=BaseOptions(model_asset_path="hand_landmarker.task"),
+    base_options=BaseOptions(model_asset_path=resource_path("hand_landmarker.task")),
     running_mode=RunningMode.VIDEO,
     num_hands=1,
     min_hand_detection_confidence=0.7,
     min_tracking_confidence=0.7,
 )
-
 
 def dist(a, b, w, h):
     """Distance between two landmarks in pixels."""
@@ -94,7 +112,7 @@ class OneEuro:
         return x_hat
 
 
-CALIB_FILE = "calibration.json"
+CALIB_FILE = user_path("calibration.json")
 
 def load_calibration():
     try:
@@ -174,9 +192,15 @@ left_down = False             # is the left button currently held?
 pinch_start = 0.0             # when the current pinch started 
 scroll_prev_y = None
 scroll_accum = 0.0
+curerent_gesture = None       # what the model has said for the last few frames (for smoothing)
+gesture_since = 0.0           #when that gesture was started
+gesture_fired = False         # already acted on this hold? 
+last_action_t = 0.0           
+action_label = ""             # shown on screen briefly when a gesture action is fired
+action_label_t = 0.0
 
 try:
-    gesture_model = joblib.load("gesture_model.joblib")
+    gesture_model = joblib.load(resource_path("gesture_model.joblib"))
 except Exception:
     gesture_model = None
 recent = deque(maxlen=5)             # recent gesture predictions, for smoothing
@@ -224,11 +248,13 @@ try:
                     ratios["left"], ratios["right"], ratios["scroll"])
 
                 # ---- decide the current mode ----
-                paused = is_fist(hand, w, h)
+                paused = is_fist(hand, w, h) and gesture not in GESTURE_ACTIONS
                 if paused:
                     new_mode = None
                 elif mode is not None and ratios[mode] < PINCH_OFF:
                     new_mode = mode                    # keep holding the same pinch
+                elif gesture in GESTURE_ACTIONS:
+                    new_mode = None
                 else:
                     best = min(ratios, key=ratios.get)
                     new_mode = best if ratios[best] < PINCH_ON else None
@@ -282,12 +308,24 @@ try:
                     cur_y = max(EDGE, min(screen_h - 1 - EDGE, ty))
                     pyautogui.moveTo(int(cur_x), int(cur_y))
 
+                # ---- gesture -> action ----
+                if gesture != current_gesture:
+                    current_gesture, gesture_since, gesture_fired = gesture, now, False
+                elif (not gesture_fired and gesture in GESTURE_ACTIONS and mode is None
+                      and now - gesture_since >= GESTURE_HOLD
+                      and now - last_action_t >= GESTURE_COOLDOWN):
+                    GESTURE_ACTIONS[gesture]()
+                    gesture_fired = True
+                    last_action_t = now
+                    action_label, action_label_t = gesture, now
+
                 # ---- draw the hand ----
                 for lm in hand:
                     cv2.circle(frame, (int(lm.x * w), int(lm.y * h)), 4, (0, 255, 0), -1)
                 cv2.circle(frame, (int(pointer.x * w), int(pointer.y * h)), 10, (0, 0, 255), -1)
             else:
                 # hand left the frame: let go of everything
+                current_gesture = None
                 if left_down:
                     pyautogui.mouseUp()
                     left_down = False
@@ -305,6 +343,9 @@ try:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             cv2.putText(frame, "gesture: " + gesture, (10, 110),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+            if time.time() - action_label_t < 1.2:
+                cv2.putText(frame, "-> " + action_label, (10, 145),
+                            cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 160, 0), 3)
 
             cv2.imshow("Hand Mouse", frame)
             key = cv2.waitKey(1) & 0xFF
