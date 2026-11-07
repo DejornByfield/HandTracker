@@ -1,3 +1,4 @@
+# HandMouse: control the mouse with your hand
 import math
 import time
 
@@ -13,6 +14,9 @@ from features import hand_features
 
 import os 
 import sys
+
+import pystray 
+from PIL import  Image, ImageDraw
 
 
 
@@ -205,6 +209,60 @@ except Exception:
     gesture_model = None
 recent = deque(maxlen=5)             # recent gesture predictions, for smoothing
 
+# ---------------- tray icon ----------------
+enabled = True          # the "Enabled" checkbox
+show_preview = True     # the "Show camera preview" checkbox
+want_calibrate = False
+want_quit = False
+window_open = False
+
+
+def make_icon_image(on):
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse((2, 2, 62, 62), fill=(46, 160, 67, 255) if on else (130, 130, 130, 255))
+    d.rounded_rectangle((20, 33, 44, 52), radius=6, fill="white")      # palm
+    for i, x in enumerate((20, 27, 34, 41)):                            # fingers
+        d.rounded_rectangle((x, 14 if i in (1, 2) else 19, x + 4, 38), radius=2, fill="white")
+    d.rounded_rectangle((12, 34, 22, 39), radius=2, fill="white")       # thumb
+    return img
+
+
+def toggle_enabled(icon, item):
+    global enabled
+    enabled = not enabled
+    icon.icon = make_icon_image(enabled)
+    icon.title = "Hand Mouse - " + ("on" if enabled else "paused")
+
+
+def toggle_preview(icon, item):
+    global show_preview
+    show_preview = not show_preview
+
+
+def do_recalibrate(icon, item):
+    global want_calibrate
+    want_calibrate = True
+
+
+def do_quit(icon, item):
+    global want_quit
+    want_quit = True
+    icon.stop()
+
+
+tray = pystray.Icon(
+    "HandMouse", make_icon_image(True), "Hand Mouse - on",
+    pystray.Menu(
+        pystray.MenuItem("Enabled", toggle_enabled, checked=lambda item: enabled, default=True),
+        pystray.MenuItem("Show camera preview", toggle_preview, checked=lambda item: show_preview),
+        pystray.MenuItem("Recalibrate", do_recalibrate),
+        pystray.MenuItem("Quit", do_quit),
+    ),
+)
+tray.run_detached()      # the tray runs in its own thread; your camera loop keeps the main one
+
+
 try:
     with HandLandmarker.create_from_options(options) as landmarker:
         calib = load_calibration() or calibrate(cap, landmarker)
@@ -227,7 +285,7 @@ try:
             ratio_text = ""
             gesture = ""
 
-            if result.hand_landmarks:
+            if result.hand_landmarks and enabled:
                 hand = result.hand_landmarks[0]
                 if gesture_model is not None: 
                     feats = hand_features(hand, w, h).reshape(1, -1)
@@ -326,6 +384,8 @@ try:
             else:
                 # hand left the frame: let go of everything
                 current_gesture = None
+                if not enabled:
+                    status = "DISABLED"
                 if left_down:
                     pyautogui.mouseUp()
                     left_down = False
@@ -347,11 +407,17 @@ try:
                 cv2.putText(frame, "-> " + action_label, (10, 145),
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 160, 0), 3)
 
-            cv2.imshow("Hand Mouse", frame)
+            if show_preview:
+                cv2.imshow("Hand Mouse", frame)
+                window_open = True
+            elif window_open:
+                cv2.destroyWindow("Hand Mouse")
+                window_open = False
             key = cv2.waitKey(1) & 0xFF
-            if key == ord("q"):
+            if key == ord("q") or want_quit:
                 break
-            if key == ord("c"):
+            if key == ord("c") or want_calibrate:
+                want_calibrate = False
                 if left_down:
                     pyautogui.mouseUp()
                     left_down = False
@@ -362,8 +428,18 @@ try:
                     save_calibration(BOX_X, BOX_Y)
                 filt_x.reset()
                 filt_y.reset()
+                window_open = True       # calibrate() opens the window itself
+
+            if window_open and cv2.getWindowProperty("Hand Mouse", cv2.WND_PROP_VISIBLE) < 1:
+                show_preview = False     # you closed the window with the X button
+                window_open = False
 finally:
     if left_down:
         pyautogui.mouseUp()
     cap.release()
     cv2.destroyAllWindows()
+
+    try:
+        tray.stop()
+    except Exception:
+        pass
