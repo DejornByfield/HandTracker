@@ -18,7 +18,8 @@ import sys
 import pystray 
 from PIL import  Image, ImageDraw
 
-
+import ctypes 
+from ctypes import wintypes
 
 CAM_W, CAM_H = 1280, 720      # camera resolution (higher = better tracking at distance)
 BOX_X = (0.20, 0.80)          # part of the camera frame (left..right) that maps to the full screen
@@ -45,6 +46,36 @@ BaseOptions = mp.tasks.BaseOptions
 HandLandmarker = mp.tasks.vision.HandLandmarker
 HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
 RunningMode = mp.tasks.vision.RunningMode
+
+
+#Stop Throttling on Windows 10/11 so the camera can run at full speed
+def disable_throttling():
+    """Ask Windows not to slow this process down when its window is minimized."""
+    if sys.platform != "win32":
+        return
+    try:
+        class POWER_THROTTLING(ctypes.Structure):
+            _fields_ = [("Version", wintypes.ULONG),
+                        ("ControlMask", wintypes.ULONG),
+                        ("StateMask", wintypes.ULONG)]
+
+        k32 = ctypes.WinDLL("kernel32")
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.SetProcessInformation.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                              ctypes.c_void_p, wintypes.DWORD]
+        k32.SetPriorityClass.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+
+        proc = k32.GetCurrentProcess()
+        state = POWER_THROTTLING(1, 0x1, 0x0)       # 0x1 = execution speed, state 0 = don't throttle
+        k32.SetProcessInformation(proc, 4, ctypes.byref(state), ctypes.sizeof(state))
+        k32.SetPriorityClass(proc, 0x8000)          # above normal priority
+        ctypes.WinDLL("winmm").timeBeginPeriod(1)   # finer timer ticks (1 ms)
+    except Exception:
+        pass
+
+
+disable_throttling()
+
 
 def resource_path(name): 
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
